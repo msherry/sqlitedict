@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2011 Radim Rehurek <radimrehurek@seznam.cz>
-
-# Hacked together from:
+# This code is distributed under the terms and conditions
+# from the Apache License, Version 2.0
+#
+# http://opensource.org/licenses/apache2.0.php
+#
+# This code was inspired by:
 #  * http://code.activestate.com/recipes/576638-draft-for-an-sqlite3-based-dbm/
 #  * http://code.activestate.com/recipes/526618/
-#
-# Use the code in any way you like (at your own risk), it's public domain.
 
 """
 A lightweight wrapper around Python's sqlite3 database, with a dict-like interface
@@ -25,24 +26,43 @@ don't forget to call `mydict.commit()` when done with a transaction.
 
 """
 
-
 import sqlite3
 import os
+import sys
 import tempfile
 import random
 import logging
-from cPickle import dumps, loads, HIGHEST_PROTOCOL as PICKLE_PROTOCOL
-from UserDict import DictMixin
-from Queue import Queue
+
 from threading import Thread
 
+_major_version = sys.version_info[0]
+if _major_version < 3: # py <= 2.x
+  if sys.version_info[1] < 5: # py <= 2.4
+    raise ImportError("sqlitedict requires python 2.5 or higher (python 3.3 or higher supported)")
 
-logger = logging.getLogger('sqlitedict')
+try:
+    from cPickle import dumps, loads, HIGHEST_PROTOCOL as PICKLE_PROTOCOL
+except ImportError:
+    from pickle import dumps, loads, HIGHEST_PROTOCOL as PICKLE_PROTOCOL
 
+# some Python 3 vs 2 imports
+try:
+   from collections import UserDict as DictClass
+except ImportError:
+   from UserDict import DictMixin as DictClass
+
+try:
+    from queue import Queue
+except ImportError:
+    from Queue import Queue
+
+
+
+logger = logging.getLogger(__name__)
 
 
 def open(*args, **kwargs):
-    """See documentation of the SqlDict class."""
+    """See documentation of the SqliteDict class."""
     return SqliteDict(*args, **kwargs)
 
 
@@ -53,10 +73,10 @@ def encode(obj):
 
 def decode(obj):
     """Deserialize objects retrieved from SQLite."""
-    return loads(str(obj))
+    return loads(bytes(obj))
 
 
-class SqliteDict(object, DictMixin):
+class SqliteDict(DictClass):
     def __init__(self, filename=None, tablename='unnamed', flag='c',
                  autocommit=False, journal_mode="DELETE"):
         """
@@ -87,6 +107,12 @@ class SqliteDict(object, DictMixin):
         if flag == 'n':
             if os.path.exists(filename):
                 os.remove(filename)
+
+        dirname = os.path.dirname(filename)
+        if dirname:
+            if not os.path.exists(dirname):
+                raise RuntimeError('Error! The directory does not exist, %s' % dirname)
+
         self.filename = filename
         self.tablename = tablename
 
@@ -105,8 +131,10 @@ class SqliteDict(object, DictMixin):
         self.close()
 
     def __str__(self):
-#        return "SqliteDict(%i items in %s)" % (len(self), self.conn.filename)
         return "SqliteDict(%s)" % (self.conn.filename)
+
+    def __repr__(self):
+        return str(self) # no need of something complex
 
     def __len__(self):
         # `select count (*)` is super slow in sqlite (does a linear scan!!)
@@ -119,23 +147,23 @@ class SqliteDict(object, DictMixin):
         return rows if rows is not None else 0
 
     def __bool__(self):
-        GET_LEN = 'SELECT MAX(ROWID) FROM %s' % self.tablename
-        return self.conn.select_one(GET_LEN) is not None
+        # No elements is False, otherwise True
+        GET_MAX = 'SELECT MAX(ROWID) FROM %s' % self.tablename
+        m = self.conn.select_one(GET_MAX)[0]
+        # Explicit better than implicit and bla bla
+        return True if m is not None else False
 
-    def iterkeys(self):
+    def keys(self):
         GET_KEYS = 'SELECT key FROM %s ORDER BY rowid' % self.tablename
-        for key in self.conn.select(GET_KEYS):
-            yield key[0]
+        return [key[0] for key in self.conn.select(GET_KEYS)]
 
-    def itervalues(self):
+    def values(self):
         GET_VALUES = 'SELECT value FROM %s ORDER BY rowid' % self.tablename
-        for value in self.conn.select(GET_VALUES):
-            yield decode(value[0])
+        return  [decode(value[0]) for value in self.conn.select(GET_VALUES)]
 
-    def iteritems(self):
+    def items(self):
         GET_ITEMS = 'SELECT key, value FROM %s ORDER BY rowid' % self.tablename
-        for key, value in self.conn.select(GET_ITEMS):
-            yield key, decode(value)
+        return [(key,decode(value)) for key,value in self.conn.select(GET_ITEMS)]
 
     def __contains__(self, key):
         HAS_ITEM = 'SELECT 1 FROM %s WHERE key = ?' % self.tablename
@@ -146,7 +174,6 @@ class SqliteDict(object, DictMixin):
         item = self.conn.select_one(GET_ITEM, (key,))
         if item is None:
             raise KeyError(key)
-
         return decode(item[0])
 
     def __setitem__(self, key, value):
@@ -161,7 +188,7 @@ class SqliteDict(object, DictMixin):
 
     def update(self, items=(), **kwds):
         try:
-            items = [(k, encode(v)) for k, v in items.iteritems()]
+            items = [(k, encode(v)) for k, v in items.items()]
         except AttributeError:
             pass
 
@@ -170,17 +197,8 @@ class SqliteDict(object, DictMixin):
         if kwds:
             self.update(kwds)
 
-    def keys(self):
-        return list(self.iterkeys())
-
-    def values(self):
-        return list(self.itervalues())
-
-    def items(self):
-        return list(self.iteritems())
-
     def __iter__(self):
-        return self.iterkeys()
+        return iter(self.keys())
 
     def clear(self):
         CLEAR_ALL = 'DELETE FROM %s;' % self.tablename # avoid VACUUM, as it gives "OperationalError: database schema has changed"
@@ -209,11 +227,15 @@ class SqliteDict(object, DictMixin):
     def terminate(self):
         """Delete the underlying database file. Use with care."""
         self.close()
+
+        if self.filename == ':memory:':
+            return
+
         logger.info("deleting %s" % self.filename)
         try:
             os.remove(self.filename)
-        except IOError, e:
-            logger.warning("failed to delete %s: %s" % (self.filename, e))
+        except IOError:
+            logger.exception("failed to delete %s" % (self.filename))
 
     def __del__(self):
         # like close(), but assume globals are gone by now (such as the logger)
@@ -227,8 +249,15 @@ class SqliteDict(object, DictMixin):
                 os.remove(self.filename)
         except:
             pass
-#endclass SqliteDict
 
+# Adding extra methods for python 2 compatibility (at import time)
+if _major_version == 2:
+    setattr(SqliteDict, "iterkeys", lambda self: self.keys())
+    setattr(SqliteDict, "itervalues", lambda self: self.values())
+    setattr(SqliteDict, "iteritems", lambda self: self.items())
+    SqliteDict.__nonzero__ = SqliteDict.__bool__
+    del SqliteDict.__bool__ # not needed and confusing
+#endclass SqliteDict
 
 
 class SqliteMultithread(Thread):
@@ -304,7 +333,7 @@ class SqliteMultithread(Thread):
     def select_one(self, req, arg=None):
         """Return only the first row of the SELECT, or None if there are no matching rows."""
         try:
-            return iter(self.select(req, arg)).next()
+            return next(iter(self.select(req, arg)))
         except StopIteration:
             return None
 
@@ -313,58 +342,5 @@ class SqliteMultithread(Thread):
 
     def close(self):
         self.execute('--close--')
+        self.join()
 #endclass SqliteMultithread
-
-
-# running sqlitedict.py as script will perform a simple unit test
-if __name__ in '__main___':
-    logging.basicConfig(format='%(asctime)s : %(levelname)s : %(module)s:%(lineno)d : %(funcName)s(%(threadName)s) : %(message)s')
-    logging.root.setLevel(level=logging.INFO)
-    for d in SqliteDict(), SqliteDict('example', flag='n'):
-        assert list(d) == []
-        assert len(d) == 0
-        assert not d
-        d['abc'] = 'rsvp' * 100
-        assert d['abc'] == 'rsvp' * 100
-        assert len(d) == 1
-        d['abc'] = 'lmno'
-        assert d['abc'] == 'lmno'
-        assert len(d) == 1
-        del d['abc']
-        assert not d
-        assert len(d) == 0
-        d['abc'] = 'lmno'
-        d['xyz'] = 'pdq'
-        assert len(d) == 2
-        assert list(d.iteritems()) == [('abc', 'lmno'), ('xyz', 'pdq')]
-        assert d.items() == [('abc', 'lmno'), ('xyz', 'pdq')]
-        assert d.values() == ['lmno', 'pdq']
-        assert d.keys() == ['abc', 'xyz']
-        assert list(d) == ['abc', 'xyz']
-        d.update(p='x', q='y', r='z')
-        assert len(d) == 5
-        assert d.items() == [('abc', 'lmno'), ('xyz', 'pdq'), ('q', 'y'), ('p', 'x'), ('r', 'z')]
-        del d['abc']
-        try:
-            error = d['abc']
-        except KeyError:
-            pass
-        else:
-            assert False
-        try:
-            del d['abc']
-        except KeyError:
-            pass
-        else:
-            assert False
-        assert list(d) == ['xyz', 'q', 'p', 'r']
-        assert d
-        d.clear()
-        assert not d
-        assert list(d) == []
-        d.update(p='x', q='y', r='z')
-        assert list(d) == ['q', 'p', 'r']
-        d.clear()
-        assert not d
-        d.close()
-    print 'all tests passed :-)'
